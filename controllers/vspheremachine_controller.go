@@ -258,8 +258,15 @@ func (r *machineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, machineContext.GetVSphereMachine()); err != nil || isPaused || requeue {
+	isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, machineContext.GetVSphereMachine())
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if requeue {
+		return ctrl.Result{}, nil
+	}
+	if isPaused && machineContext.GetObjectMeta().DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 
 	machineContext.SetBaseMachineContext(&capvcontext.BaseMachineContext{

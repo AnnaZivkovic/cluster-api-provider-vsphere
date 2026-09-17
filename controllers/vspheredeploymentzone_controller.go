@@ -114,8 +114,15 @@ func (r vsphereDeploymentZoneReconciler) Reconcile(ctx context.Context, request 
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, nil, vsphereDeploymentZone); err != nil || isPaused || requeue {
+	isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, nil, vsphereDeploymentZone)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if requeue {
+		return ctrl.Result{}, nil
+	}
+	if isPaused && vsphereDeploymentZone.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 
 	vsphereDeploymentZoneContext := &capvcontext.VSphereDeploymentZoneContext{

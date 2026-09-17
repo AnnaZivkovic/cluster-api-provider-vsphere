@@ -165,8 +165,15 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereVM); err != nil || isPaused || requeue {
+	isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereVM)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if requeue {
+		return ctrl.Result{}, nil
+	}
+	if isPaused && vsphereVM.ObjectMeta.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 
 	authSession, err := r.retrieveVcenterSession(ctx, vsphereVM)
