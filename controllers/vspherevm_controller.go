@@ -187,70 +187,10 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		Reason: infrav1.VSphereVMVCenterAvailableReason,
 	})
 
-	// Fetch the owner VSphereMachine.
-	vsphereMachine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vsphereVM.ObjectMeta)
-	// vsphereMachine can be nil in cases where custom mover other than clusterctl
-	// moves the resources without ownerreferences set
-	// in that case nil vsphereMachine can cause panic and CrashLoopBackOff the pod
-	// preventing vspheremachine_controller from setting the ownerref
-	if err != nil {
-		return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereMachine for VSphereVM")
-	}
-	if vsphereMachine == nil {
-		log.Info("Waiting for VSphereMachine controller to set OwnerRef on VSphereVM")
-		return reconcile.Result{}, nil
-	}
-
-	log = log.WithValues("VSphereMachine", klog.KObj(vsphereMachine))
-	ctx = ctrl.LoggerInto(ctx, log)
-
-	vsphereCluster, err := util.GetVSphereClusterFromVSphereMachine(ctx, r.Client, vsphereMachine)
-	if err != nil || vsphereCluster == nil {
-		return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereCluster from VSphereMachine")
-	}
-
-	log = log.WithValues("VSphereCluster", klog.KObj(vsphereCluster))
-	ctx = ctrl.LoggerInto(ctx, log)
-
-	// Fetch the CAPI Machine.
-	machine, err := clusterutilv1.GetOwnerMachine(ctx, r.Client, vsphereMachine.ObjectMeta)
-	if err != nil {
-		return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get Machine for VSphereMachine")
-	}
-	if machine == nil {
-		log.Info("Waiting for Machine controller to set OwnerRef on VSphereMachine")
-		return reconcile.Result{}, nil
-	}
-	log = log.WithValues("Machine", klog.KObj(machine))
-	ctx = ctrl.LoggerInto(ctx, log)
-
-	// AddOwners adds the owners of Machine as k/v pairs to the logger.
-	// Specifically, it will add KubeadmControlPlane, MachineSet and MachineDeployment.
-	ctx, log, err = clog.AddOwners(ctx, r.Client, machine)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	failureDomain := machine.Spec.FailureDomain
-
-	var vsphereFailureDomain *infrav1.VSphereFailureDomain
-	if failureDomain != "" {
-		vsphereDeploymentZone := &infrav1.VSphereDeploymentZone{}
-		if err := r.Client.Get(ctx, apitypes.NamespacedName{Name: failureDomain}, vsphereDeploymentZone); err != nil {
-			return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereDeploymentZone %s", failureDomain)
-		}
-
-		vsphereFailureDomain = &infrav1.VSphereFailureDomain{}
-		if err := r.Client.Get(ctx, apitypes.NamespacedName{Name: vsphereDeploymentZone.Spec.FailureDomain}, vsphereFailureDomain); err != nil {
-			return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereFailureDomain %s", vsphereDeploymentZone.Spec.FailureDomain)
-		}
-	}
-
 	// Create the VM context for this request.
 	vmContext := &capvcontext.VMContext{
 		ControllerManagerContext: r.ControllerManagerContext,
 		VSphereVM:                vsphereVM,
-		VSphereFailureDomain:     vsphereFailureDomain,
 		Session:                  authSession,
 		PatchHelper:              patchHelper,
 	}
@@ -341,6 +281,71 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 			reterr = kerrors.NewAggregate([]error{reterr, err})
 		}
 	}()
+
+	// Fetch the owner VSphereMachine.
+	vsphereMachine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vsphereVM.ObjectMeta)
+	if apierrors.IsNotFound(err) && !vsphereVM.DeletionTimestamp.IsZero() {
+		// Without the owner, do not fall back to identifying a VM by name.
+		if vsphereVM.Spec.BiosUUID == "" {
+			return reconcile.Result{}, pkgerrors.New("cannot delete VSphereVM without its VSphereMachine: BIOS UUID is required")
+		}
+		vmContext.ClusterModuleInfo = vsphereVM.Status.ModuleUUID
+		return r.reconcileDelete(ctx, vmContext)
+	}
+	// vsphereMachine can be nil in cases where custom mover other than clusterctl
+	// moves the resources without ownerreferences set
+	// in that case nil vsphereMachine can cause panic and CrashLoopBackOff the pod
+	// preventing vspheremachine_controller from setting the ownerref
+	if err != nil {
+		return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereMachine for VSphereVM")
+	}
+	if vsphereMachine == nil {
+		log.Info("Waiting for VSphereMachine controller to set OwnerRef on VSphereVM")
+		return reconcile.Result{}, nil
+	}
+
+	log = log.WithValues("VSphereMachine", klog.KObj(vsphereMachine))
+	ctx = ctrl.LoggerInto(ctx, log)
+
+	vsphereCluster, err := util.GetVSphereClusterFromVSphereMachine(ctx, r.Client, vsphereMachine)
+	if err != nil || vsphereCluster == nil {
+		return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereCluster from VSphereMachine")
+	}
+
+	log = log.WithValues("VSphereCluster", klog.KObj(vsphereCluster))
+	ctx = ctrl.LoggerInto(ctx, log)
+
+	// Fetch the CAPI Machine.
+	machine, err := clusterutilv1.GetOwnerMachine(ctx, r.Client, vsphereMachine.ObjectMeta)
+	if err != nil {
+		return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get Machine for VSphereMachine")
+	}
+	if machine == nil {
+		log.Info("Waiting for Machine controller to set OwnerRef on VSphereMachine")
+		return reconcile.Result{}, nil
+	}
+	log = log.WithValues("Machine", klog.KObj(machine))
+	ctx = ctrl.LoggerInto(ctx, log)
+
+	// AddOwners adds the owners of Machine as k/v pairs to the logger.
+	// Specifically, it will add KubeadmControlPlane, MachineSet and MachineDeployment.
+	ctx, log, err = clog.AddOwners(ctx, r.Client, machine)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	failureDomain := machine.Spec.FailureDomain
+	if failureDomain != "" {
+		vsphereDeploymentZone := &infrav1.VSphereDeploymentZone{}
+		if err := r.Client.Get(ctx, apitypes.NamespacedName{Name: failureDomain}, vsphereDeploymentZone); err != nil {
+			return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereDeploymentZone %s", failureDomain)
+		}
+
+		vmContext.VSphereFailureDomain = &infrav1.VSphereFailureDomain{}
+		if err := r.Client.Get(ctx, apitypes.NamespacedName{Name: vsphereDeploymentZone.Spec.FailureDomain}, vmContext.VSphereFailureDomain); err != nil {
+			return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereFailureDomain %s", vsphereDeploymentZone.Spec.FailureDomain)
+		}
+	}
 
 	return r.reconcile(ctx, vmContext, fetchClusterModuleInput{
 		VSphereCluster: vsphereCluster,
@@ -661,6 +666,9 @@ func (r vmReconciler) retrieveVcenterSession(ctx context.Context, vsphereVM *inf
 
 	cluster, err := clusterutilv1.GetClusterFromMetadata(ctx, r.Client, vsphereVM.ObjectMeta)
 	if err != nil {
+		if !vsphereVM.DeletionTimestamp.IsZero() {
+			return nil, pkgerrors.Wrap(err, "cannot retrieve vCenter session for VSphereVM deletion")
+		}
 		log.V(4).Info("Using credentials provided to the manager to create the authenticated session, VSphereVM is missing cluster label or cluster does not exist")
 		return session.GetOrCreate(ctx, params)
 	}
@@ -675,6 +683,9 @@ func (r vmReconciler) retrieveVcenterSession(ctx context.Context, vsphereVM *inf
 	vsphereCluster := &infrav1.VSphereCluster{}
 	err = r.Client.Get(ctx, key, vsphereCluster)
 	if err != nil {
+		if !vsphereVM.DeletionTimestamp.IsZero() {
+			return nil, pkgerrors.Wrap(err, "cannot retrieve vCenter session for VSphereVM deletion")
+		}
 		log.V(4).Info("Using credentials provided to the manager to create the authenticated session, failed to get VSphereCluster")
 		return session.GetOrCreate(ctx, params)
 	}
