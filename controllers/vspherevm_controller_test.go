@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/api/govmomi/v1beta2"
@@ -48,6 +50,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	fake_svc "sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/fake"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi"
 )
 
 func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
@@ -300,6 +303,170 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 		ipacKey := util.ObjectKey(ipAddressClaim)
 		g.Expect(r.Client.Get(context.Background(), ipacKey, claim)).NotTo(HaveOccurred())
 		g.Expect(claim.ObjectMeta.Finalizers).NotTo(ContainElement(infrav1.IPAddressClaimFinalizer))
+	})
+
+	t.Run("Deleting a VM whose VSphereMachine is already absent", func(t *testing.T) {
+		for _, tt := range []struct {
+			name             string
+			state            services.VirtualMachineState
+			destroyErr       error
+			claimUpdateError bool
+			missingBIOSUUID  bool
+			ownerLookupError bool
+			infraLookupError bool
+			infraMissing     bool
+			identityMissing  bool
+			wantError        string
+			wantFinalizers   bool
+		}{
+			{
+				name: "external VM already absent",
+			},
+			{
+				name:           "external VM lookup denied",
+				destroyErr:     fmt.Errorf("vCenter lookup denied"),
+				wantError:      "vCenter lookup denied",
+				wantFinalizers: true,
+			},
+			{
+				name:           "external deletion still pending",
+				state:          services.VirtualMachineStatePending,
+				wantFinalizers: true,
+			},
+			{
+				name:             "IP claim cleanup fails",
+				state:            services.VirtualMachineStateNotFound,
+				claimUpdateError: true,
+				wantError:        "IP claim update denied",
+				wantFinalizers:   true,
+			},
+			{
+				name:            "no BIOS UUID must not fall back to a VM name",
+				missingBIOSUUID: true,
+				wantError:       "BIOS UUID",
+				wantFinalizers:  true,
+			},
+			{
+				name:             "owner lookup forbidden is not owner absence",
+				ownerLookupError: true,
+				wantError:        "forbidden",
+				wantFinalizers:   true,
+			},
+			{
+				name:             "infrastructure lookup forbidden is not VM absence",
+				infraLookupError: true,
+				wantError:        "forbidden",
+				wantFinalizers:   true,
+			},
+			{
+				name:           "infrastructure NotFound is not VM absence",
+				infraMissing:   true,
+				wantError:      "cannot retrieve vCenter session for VSphereVM deletion",
+				wantFinalizers: true,
+			},
+			{
+				name:            "referenced credentials must remain available",
+				identityMissing: true,
+				wantError:       "failed to get credentials from IdentityRef",
+				wantFinalizers:  true,
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				g := NewWithT(t)
+				ctx := context.Background()
+				create(infrav1.NetworkSpec{Devices: []infrav1.NetworkDeviceSpec{{
+					NetworkName: "nw-1",
+					AddressesFromPools: []infrav1.IPPoolReference{{
+						APIGroup: poolAPIGroup,
+						Kind:     "IPAMPools",
+						Name:     "my-ip-pool",
+					}},
+				}}})()
+				vsphereVM.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+				cluster.Spec.Paused = ptr.To(false)
+				vsphereVM.Finalizers = append(vsphereVM.Finalizers, "test/retain")
+				vsphereVM.Spec.BiosUUID = "00000000-0000-0000-0000-000000000000"
+				if tt.missingBIOSUUID {
+					vsphereVM.Spec.BiosUUID = ""
+				}
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "vm-credentials", Namespace: "test"},
+					Data: map[string][]byte{
+						identity.UsernameKey: []byte(simr.Username()),
+						identity.PasswordKey: []byte(simr.Password()),
+					},
+				}
+				vsphereCluster.Spec.IdentityRef = infrav1.VSphereIdentityReference{Kind: infrav1.SecretKind, Name: secret.Name}
+				if !tt.identityMissing {
+					initObjs = append(initObjs, secret)
+				}
+				vsphereVM.Status.ModuleUUID = ptr.To("surviving-module")
+				g.Expect(vsphereVM.Annotations).NotTo(HaveKey(clusterv1.PausedAnnotation))
+				g.Expect(ptr.Deref(cluster.Spec.Paused, false)).To(BeFalse())
+
+				// Exercise real vCenter absence detection; use the existing service mock
+				// only for pending operations and errors at the external boundary.
+				var vmService services.VirtualMachineService = &govmomi.VMService{}
+				if tt.state != "" || tt.destroyErr != nil || tt.missingBIOSUUID || tt.ownerLookupError || tt.infraLookupError || tt.infraMissing || tt.identityMissing {
+					fakeVMSvc := new(fake_svc.VMService)
+					if !tt.missingBIOSUUID && !tt.ownerLookupError && !tt.infraLookupError && !tt.infraMissing && !tt.identityMissing {
+						fakeVMSvc.On("DestroyVM", mock.Anything).Run(func(args mock.Arguments) {
+							vmCtx := args.Get(0).(*capvcontext.VMContext)
+							g.Expect(vmCtx.ClusterModuleInfo).To(Equal(ptr.To("surviving-module")))
+						}).Return(reconcile.Result{}, services.VirtualMachine{
+							Name: vsphereVM.Name, State: tt.state,
+						}, tt.destroyErr)
+					}
+					vmService = fakeVMSvc
+				}
+				r := setupReconciler(vmService)
+				r.Username, r.Password = "unused-manager-user", "unused-manager-password"
+				g.Expect(r.Client.Delete(ctx, vsphereMachine)).To(Succeed())
+				g.Expect(apierrors.IsNotFound(r.Client.Get(ctx, util.ObjectKey(vsphereMachine), &infrav1.VSphereMachine{}))).To(BeTrue())
+				if tt.infraMissing {
+					g.Expect(r.Client.Delete(ctx, vsphereCluster)).To(Succeed())
+				}
+				r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*infrav1.VSphereMachine); ok && tt.ownerLookupError {
+							return apierrors.NewForbidden(infrav1.GroupVersion.WithResource("vspheremachines").GroupResource(), key.Name, fmt.Errorf("owner lookup denied"))
+						}
+						if _, ok := obj.(*infrav1.VSphereCluster); ok && tt.infraLookupError {
+							return apierrors.NewForbidden(infrav1.GroupVersion.WithResource("vsphereclusters").GroupResource(), key.Name, fmt.Errorf("infrastructure lookup denied"))
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+					Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+						if _, ok := obj.(*ipamv1.IPAddressClaim); ok && tt.claimUpdateError {
+							return fmt.Errorf("IP claim update denied")
+						}
+						return c.Update(ctx, obj, opts...)
+					},
+				})
+
+				// First reconcile initializes the unpaused condition.
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+				g.Expect(err).NotTo(HaveOccurred())
+				_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+				if tt.wantError != "" {
+					g.Expect(err).To(MatchError(ContainSubstring(tt.wantError)))
+				} else {
+					g.Expect(err).NotTo(HaveOccurred())
+				}
+				vm := &infrav1.VSphereVM{}
+				g.Expect(r.Client.Get(ctx, util.ObjectKey(vsphereVM), vm)).To(Succeed())
+				g.Expect(vm.Finalizers).To(ContainElement("test/retain"))
+				g.Expect(slices.Contains(vm.Finalizers, infrav1.VMFinalizer)).To(Equal(tt.wantFinalizers))
+				claim := &ipamv1.IPAddressClaim{}
+				g.Expect(r.Client.Get(ctx, util.ObjectKey(ipAddressClaim), claim)).To(Succeed())
+				g.Expect(slices.Contains(claim.Finalizers, infrav1.IPAddressClaimFinalizer)).To(Equal(tt.wantFinalizers))
+				if !tt.wantFinalizers {
+					// Cleanup remains safe when reconciled again after completion.
+					_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+					g.Expect(err).NotTo(HaveOccurred())
+				}
+			})
+		}
 	})
 }
 
