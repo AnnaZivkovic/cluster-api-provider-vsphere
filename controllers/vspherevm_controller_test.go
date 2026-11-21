@@ -307,20 +307,39 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 
 	t.Run("Deleting a VM whose VSphereMachine is already absent", func(t *testing.T) {
 		for _, tt := range []struct {
-			name             string
-			state            services.VirtualMachineState
-			destroyErr       error
-			claimUpdateError bool
-			missingBIOSUUID  bool
-			ownerLookupError bool
-			infraLookupError bool
-			infraMissing     bool
-			identityMissing  bool
-			wantError        string
-			wantFinalizers   bool
+			name                 string
+			state                services.VirtualMachineState
+			destroyErr           error
+			claimUpdateError     bool
+			missingBIOSUUID      bool
+			ownerLookupError     bool
+			infraLookupError     bool
+			infraMissing         bool
+			identityMissing      bool
+			moduleFeatureEnabled bool
+			disableClusterModule bool
+			wantModuleUUID       *string
+			wantError            string
+			wantFinalizers       bool
 		}{
 			{
 				name: "external VM already absent",
+			},
+			{
+				name:  "recorded module ignored when feature disabled",
+				state: services.VirtualMachineStateNotFound,
+			},
+			{
+				name:                 "recorded module ignored when cluster modules disabled",
+				state:                services.VirtualMachineStateNotFound,
+				moduleFeatureEnabled: true,
+				disableClusterModule: true,
+			},
+			{
+				name:                 "recorded module used when enabled",
+				state:                services.VirtualMachineStateNotFound,
+				moduleFeatureEnabled: true,
+				wantModuleUUID:       ptr.To("surviving-module"),
 			},
 			{
 				name:           "external VM lookup denied",
@@ -382,6 +401,8 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 						Name:     "my-ip-pool",
 					}},
 				}}})()
+				utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.NodeAntiAffinity, tt.moduleFeatureEnabled)
+				vsphereCluster.Spec.DisableClusterModule = ptr.To(tt.disableClusterModule)
 				vsphereVM.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 				cluster.Spec.Paused = ptr.To(false)
 				vsphereVM.Finalizers = append(vsphereVM.Finalizers, "test/retain")
@@ -412,7 +433,7 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 					if !tt.missingBIOSUUID && !tt.ownerLookupError && !tt.infraLookupError && !tt.infraMissing && !tt.identityMissing {
 						fakeVMSvc.On("DestroyVM", mock.Anything).Run(func(args mock.Arguments) {
 							vmCtx := args.Get(0).(*capvcontext.VMContext)
-							g.Expect(vmCtx.ClusterModuleInfo).To(Equal(ptr.To("surviving-module")))
+							g.Expect(vmCtx.ClusterModuleInfo).To(Equal(tt.wantModuleUUID))
 						}).Return(reconcile.Result{}, services.VirtualMachine{
 							Name: vsphereVM.Name, State: tt.state,
 						}, tt.destroyErr)

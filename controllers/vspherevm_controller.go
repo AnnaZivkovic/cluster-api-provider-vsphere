@@ -169,7 +169,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	authSession, err := r.retrieveVcenterSession(ctx, vsphereVM)
+	authSession, vsphereCluster, err := r.retrieveVcenterSession(ctx, vsphereVM)
 	if err != nil {
 		deprecatedv1beta1conditions.MarkFalse(vsphereVM, infrav1.VCenterAvailableV1Beta1Condition, infrav1.VCenterUnreachableV1Beta1Reason, clusterv1.ConditionSeverityError, "%v", err)
 		conditions.Set(vsphereVM, metav1.Condition{
@@ -289,7 +289,9 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		if vsphereVM.Spec.BiosUUID == "" {
 			return reconcile.Result{}, pkgerrors.New("cannot delete VSphereVM without its VSphereMachine: BIOS UUID is required")
 		}
-		vmContext.ClusterModuleInfo = vsphereVM.Status.ModuleUUID
+		if feature.Gates.Enabled(feature.NodeAntiAffinity) && !ptr.Deref(vsphereCluster.Spec.DisableClusterModule, false) {
+			vmContext.ClusterModuleInfo = vsphereVM.Status.ModuleUUID
+		}
 		return r.reconcileDelete(ctx, vmContext)
 	}
 	// vsphereMachine can be nil in cases where custom mover other than clusterctl
@@ -307,7 +309,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 	log = log.WithValues("VSphereMachine", klog.KObj(vsphereMachine))
 	ctx = ctrl.LoggerInto(ctx, log)
 
-	vsphereCluster, err := util.GetVSphereClusterFromVSphereMachine(ctx, r.Client, vsphereMachine)
+	vsphereCluster, err = util.GetVSphereClusterFromVSphereMachine(ctx, r.Client, vsphereMachine)
 	if err != nil || vsphereCluster == nil {
 		return reconcile.Result{}, pkgerrors.Wrapf(err, "failed to get VSphereCluster from VSphereMachine")
 	}
@@ -654,7 +656,7 @@ func (r vmReconciler) ipAddressClaimToVSphereVM(_ context.Context, a ctrlclient.
 	return requests
 }
 
-func (r vmReconciler) retrieveVcenterSession(ctx context.Context, vsphereVM *infrav1.VSphereVM) (*session.Session, error) {
+func (r vmReconciler) retrieveVcenterSession(ctx context.Context, vsphereVM *infrav1.VSphereVM) (*session.Session, *infrav1.VSphereCluster, error) {
 	log := ctrl.LoggerFrom(ctx)
 	// Get cluster object and then get VSphereCluster object
 
@@ -667,14 +669,15 @@ func (r vmReconciler) retrieveVcenterSession(ctx context.Context, vsphereVM *inf
 	cluster, err := clusterutilv1.GetClusterFromMetadata(ctx, r.Client, vsphereVM.ObjectMeta)
 	if err != nil {
 		if !vsphereVM.DeletionTimestamp.IsZero() {
-			return nil, pkgerrors.Wrap(err, "cannot retrieve vCenter session for VSphereVM deletion")
+			return nil, nil, pkgerrors.Wrap(err, "cannot retrieve vCenter session for VSphereVM deletion")
 		}
 		log.V(4).Info("Using credentials provided to the manager to create the authenticated session, VSphereVM is missing cluster label or cluster does not exist")
-		return session.GetOrCreate(ctx, params)
+		s, err := session.GetOrCreate(ctx, params)
+		return s, nil, err
 	}
 
 	if !cluster.Spec.InfrastructureRef.IsDefined() {
-		return nil, pkgerrors.Errorf("cannot retrieve vCenter session for cluster %s: Cluster.spec.infrastructureRef is nil", klog.KObj(cluster))
+		return nil, nil, pkgerrors.Errorf("cannot retrieve vCenter session for cluster %s: Cluster.spec.infrastructureRef is nil", klog.KObj(cluster))
 	}
 	key := ctrlclient.ObjectKey{
 		Namespace: cluster.Namespace,
@@ -684,24 +687,25 @@ func (r vmReconciler) retrieveVcenterSession(ctx context.Context, vsphereVM *inf
 	err = r.Client.Get(ctx, key, vsphereCluster)
 	if err != nil {
 		if !vsphereVM.DeletionTimestamp.IsZero() {
-			return nil, pkgerrors.Wrap(err, "cannot retrieve vCenter session for VSphereVM deletion")
+			return nil, nil, pkgerrors.Wrap(err, "cannot retrieve vCenter session for VSphereVM deletion")
 		}
 		log.V(4).Info("Using credentials provided to the manager to create the authenticated session, failed to get VSphereCluster")
-		return session.GetOrCreate(ctx, params)
+		s, err := session.GetOrCreate(ctx, params)
+		return s, nil, err
 	}
 
 	if vsphereCluster.Spec.IdentityRef.IsDefined() {
 		creds, err := identity.GetCredentials(ctx, r.Client, vsphereCluster, r.ControllerManagerContext.Namespace)
 		if err != nil {
-			return nil, pkgerrors.Wrap(err, "failed to get credentials from IdentityRef")
+			return nil, nil, pkgerrors.Wrap(err, "failed to get credentials from IdentityRef")
 		}
 		params = params.WithUserInfo(creds.Username, creds.Password)
-		return session.GetOrCreate(ctx, params)
+	} else {
+		log.V(4).Info("Using credentials provided to the manager to create the authenticated session")
 	}
 
-	// Fallback to using credentials provided to the manager
-	log.V(4).Info("Using credentials provided to the manager to create the authenticated session")
-	return session.GetOrCreate(ctx, params)
+	s, err := session.GetOrCreate(ctx, params)
+	return s, vsphereCluster, err
 }
 
 func (r vmReconciler) fetchClusterModuleInfo(ctx context.Context, clusterModInput fetchClusterModuleInput) (*string, error) {
